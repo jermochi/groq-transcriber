@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
+import { del } from "@vercel/blob";
 import { transcribeAudio } from "@/lib/transcribe";
-import { ACCEPTED_MIME_TYPES, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_LABEL } from "@/config/audio";
 
 // ---------------------------------------------------------------------------
 // Rate limiter — sliding window, 10 requests per minute per IP
@@ -10,14 +10,11 @@ import { ACCEPTED_MIME_TYPES, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_LABEL } from "@
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQUESTS = 10;
 
-/** Map of IP → array of request timestamps */
 const requestLog = new Map<string, number[]>();
 
 function isRateLimited(ip: string): boolean {
     const now = Date.now();
     const timestamps = requestLog.get(ip) ?? [];
-
-    // Remove timestamps outside the sliding window
     const recent = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
 
     if (recent.length >= RATE_LIMIT_MAX_REQUESTS) {
@@ -31,11 +28,11 @@ function isRateLimited(ip: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Zod schema for incoming FormData validation
+// Zod schema for incoming JSON validation
 // ---------------------------------------------------------------------------
 
-const FormDataSchema = z.object({
-    file: z.instanceof(File, { message: "An audio file is required." }),
+const TranscribeSchema = z.object({
+    blobUrl: z.string().url({ message: "A valid blob URL is required." }),
 });
 
 // ---------------------------------------------------------------------------
@@ -43,6 +40,8 @@ const FormDataSchema = z.object({
 // ---------------------------------------------------------------------------
 
 export async function POST(request: NextRequest) {
+    let blobUrl: string | undefined;
+
     try {
         // 1. Rate limiting
         const ip =
@@ -57,10 +56,10 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        // 2. Parse FormData
-        let formData: FormData;
+        // 2. Parse and Validate JSON
+        let body: unknown;
         try {
-            formData = await request.formData();
+            body = await request.json();
         } catch {
             return NextResponse.json(
                 { error: "Invalid request body." },
@@ -68,10 +67,7 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        // 3. Zod validate
-        const parsed = FormDataSchema.safeParse({
-            file: formData.get("file"),
-        });
+        const parsed = TranscribeSchema.safeParse(body);
 
         if (!parsed.success) {
             return NextResponse.json(
@@ -80,39 +76,44 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        const { file } = parsed.data;
+        blobUrl = parsed.data.blobUrl;
 
-        // 4. File size check
-        if (file.size > MAX_FILE_SIZE_BYTES) {
-            return NextResponse.json(
-                { error: `File size exceeds the ${MAX_FILE_SIZE_LABEL} limit.` },
-                { status: 413 }
-            );
+        // 3. Fetch file from Blob URL
+        const fileResponse = await fetch(blobUrl);
+        if (!fileResponse.ok) {
+            throw new Error("Failed to fetch audio file from blob storage.");
         }
 
-        // 5. MIME type allowlist
-        if (
-            !(ACCEPTED_MIME_TYPES as readonly string[]).includes(file.type)
-        ) {
-            return NextResponse.json(
-                {
-                    error: `Unsupported audio format "${file.type}". Accepted formats: ${ACCEPTED_MIME_TYPES.join(", ")}.`,
-                },
-                { status: 415 }
-            );
-        }
+        const blob = await fileResponse.blob();
+        const filename = blobUrl.split("/").pop() || "audio.webm";
+        const file = new File([blob], filename, { type: blob.type });
 
-        // 6. Transcribe
+        // 4. Transcribe
         const text = await transcribeAudio(file);
+
+        // 5. Cleanup — Delete from Vercel Blob
+        try {
+            await del(blobUrl);
+        } catch (delError) {
+            // Log deletion failure but don't fail the request
+            console.error("[POST /api/transcribe] Cleanup failed:", delError);
+        }
 
         return NextResponse.json({ text });
     } catch (error: unknown) {
-        // Log full error server-side
         console.error("[POST /api/transcribe] Unhandled error:", error);
 
-        // Return sanitized error — never leak stack traces
+        // Attempt cleanup on error as well
+        if (blobUrl) {
+            try {
+                await del(blobUrl);
+            } catch {
+                // Ignore cleanup errors during main error handling
+            }
+        }
+
         return NextResponse.json(
-            { error: "An internal error occurred. Please try again." },
+            { error: error instanceof Error ? error.message : "An internal error occurred." },
             { status: 500 }
         );
     }

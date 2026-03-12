@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useCallback } from "react";
+import { upload } from "@vercel/blob/client";
+import { sanitizeFilename } from "@/lib/utils";
 import {
     TranscribeResponseSchema,
     type TranscribeStatus,
@@ -31,12 +33,23 @@ export function useTranscribe(): UseTranscribeReturn {
         setError(null);
 
         try {
-            const formData = new FormData();
-            formData.append("file", file);
+            // 1. Sanitize filename
+            const sanitizedName = sanitizeFilename(file.name);
+            const sanitizedFile = new File([file], sanitizedName, { type: file.type });
 
+            // 2. Upload to Vercel Blob
+            const blob = await upload(sanitizedName, sanitizedFile, {
+                access: "public",
+                handleUploadUrl: "/api/upload",
+            });
+
+            // 3. Send blob URL to transcription API
             const response = await fetch("/api/transcribe", {
                 method: "POST",
-                body: formData,
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ blobUrl: blob.url }),
             });
 
             const json: unknown = await response.json();
@@ -67,8 +80,9 @@ export function useTranscribe(): UseTranscribeReturn {
 
             setTranscript(parsed.data.text);
             setStatus("success");
-        } catch {
-            setError("Network error. Please check your connection and try again.");
+        } catch (e) {
+            console.error("Transcription error:", e);
+            setError("Transcription failed. Please try again.");
             setStatus("error");
         }
     }, []);
